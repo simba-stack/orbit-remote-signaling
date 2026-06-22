@@ -1,0 +1,37 @@
+# Orbit Remote — full server stack for a VPS (Ubuntu 22.04 / Debian 12).
+# Runs the signaling server + coturn (STUN/TURN) together.
+#
+# Usage:
+#   cp .env.example .env      # fill in EXTERNAL_IP, TURN secrets, etc.
+#   docker compose up -d
+#
+# coturn uses host networking so it can use the public IP and the UDP relay
+# port range directly — required for TURN to function.
+
+services:
+  signaling:
+    build: .
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      - HOST=0.0.0.0
+      - STUN_URLS=stun:${EXTERNAL_IP}:3478
+      - TURN_URLS=turn:${EXTERNAL_IP}:3478?transport=udp,turn:${EXTERNAL_IP}:3478?transport=tcp
+      - TURN_USERNAME=${TURN_USERNAME}
+      - TURN_PASSWORD=${TURN_PASSWORD}
+    ports:
+      - "8080:8080"
+
+  coturn:
+    image: coturn/coturn:4.6
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command:
+      - -c
+      - /etc/coturn/turnserver.conf
+      - --external-ip=${EXTERNAL_IP}
+      - --realm=${TURN_REALM}
+      - --user=${TURN_USERNAME}:${TURN_PASSWORD}
