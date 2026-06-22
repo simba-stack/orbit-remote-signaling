@@ -14,10 +14,19 @@
 // whitelisting and first-connection confirmation are enforced on the agent side;
 // the server enforces existence, online status and code match.
 
+import { randomInt } from "node:crypto";
+
 const DEVICE_ID_LENGTH = 9; // AnyDesk-style numeric id
 const CODE_LENGTH = 6;
 
-function defaultGenId(rnd = Math.random) {
+// CSPRNG-backed [0,1) source so device ids and connection codes are not
+// predictable (Math.random is not cryptographically secure). Tests can still
+// inject a deterministic rnd via the function parameter.
+function secureRandom() {
+  return randomInt(0, 1_000_000) / 1_000_000;
+}
+
+function defaultGenId(rnd = secureRandom) {
   let id = "";
   // First digit non-zero so the id always has full length.
   id += String(1 + Math.floor(rnd() * 9));
@@ -27,7 +36,7 @@ function defaultGenId(rnd = Math.random) {
   return id;
 }
 
-function defaultGenCode(rnd = Math.random) {
+function defaultGenCode(rnd = secureRandom) {
   let code = "";
   for (let i = 0; i < CODE_LENGTH; i++) code += String(Math.floor(rnd() * 10));
   return code;
@@ -167,14 +176,28 @@ export function handleMessage(state, connId, msg) {
       if (!device || !device.connId || !state.connections.has(device.connId)) {
         return { actions: [send(connId, { type: "error", code: "not_found", targetId: msg.targetId })] };
       }
-      if (String(msg.code || "") !== String(device.code)) {
+      // Brute-force protection: lock a device for 60s after 5 wrong codes.
+      const nowMs = state.now();
+      if (device.lockedUntil && nowMs < device.lockedUntil) {
         return {
           actions: [
-            send(connId, { type: "error", code: "bad_code", targetId: msg.targetId }),
-            log("auth_fail", { targetId: msg.targetId, ip: conn.ip }),
+            send(connId, { type: "error", code: "locked", targetId: msg.targetId }),
+            log("auth_locked", { targetId: msg.targetId, ip: conn.ip }),
           ],
         };
       }
+      if (String(msg.code || "") !== String(device.code)) {
+        device.authFails = (device.authFails || 0) + 1;
+        if (device.authFails >= 5) device.lockedUntil = nowMs + 60_000;
+        return {
+          actions: [
+            send(connId, { type: "error", code: "bad_code", targetId: msg.targetId }),
+            log("auth_fail", { targetId: msg.targetId, ip: conn.ip, fails: device.authFails }),
+          ],
+        };
+      }
+      device.authFails = 0;
+      device.lockedUntil = 0;
 
       const sessionId = `s${++state.sessionSeq}`;
       const session = {
@@ -259,6 +282,22 @@ export function removeConnection(state, connId) {
 
   state.connections.delete(connId);
   return { actions };
+}
+
+/**
+ * Evict offline device registrations older than ttl so the devices map can't grow
+ * without bound (memory/DoS protection). Returns the number removed.
+ */
+export function sweep(state, ttlMs = 86_400_000) {
+  const cutoff = state.now() - ttlMs;
+  let removed = 0;
+  for (const [id, d] of state.devices) {
+    if (!d.connId && (d.lastSeen || 0) < cutoff) {
+      state.devices.delete(id);
+      removed++;
+    }
+  }
+  return removed;
 }
 
 /** Snapshot for diagnostics / health. */

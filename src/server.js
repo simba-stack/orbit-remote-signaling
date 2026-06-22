@@ -15,10 +15,17 @@ import {
   handleMessage,
   removeConnection,
   stats,
+  sweep,
 } from "./signaling.js";
 
 const config = getConfig();
 const state = createState();
+
+// A relay should never die on a stray async error — log and keep serving.
+process.on("unhandledRejection", (e) =>
+  logLine("unhandledRejection", { error: String(e) }));
+process.on("uncaughtException", (e) =>
+  logLine("uncaughtException", { error: String(e) }));
 
 // Map our internal connection ids to live WebSocket objects.
 const sockets = new Map();
@@ -29,13 +36,18 @@ function logLine(event, data) {
   console.log(JSON.stringify(entry));
 }
 
+function safeSend(ws, data) {
+  try {
+    if (ws && ws.readyState === ws.OPEN) ws.send(data);
+  } catch {
+    /* socket errored between check and write — 'close' will clean it up */
+  }
+}
+
 function applyActions(actions) {
   for (const action of actions) {
     if (action.kind === "send") {
-      const ws = sockets.get(action.to);
-      if (ws && ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify(action.message));
-      }
+      safeSend(sockets.get(action.to), JSON.stringify(action.message));
     } else if (action.kind === "log") {
       logLine(action.event, action.data);
     }
@@ -75,7 +87,9 @@ const httpServer = http.createServer((req, res) => {
 
 // ---- WebSocket server --------------------------------------------------
 
-const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+// Cap message size: signalling frames (SDP/ICE/control) are well under 64 KB, so
+// this blocks memory-amplification without affecting legitimate traffic.
+const wss = new WebSocketServer({ server: httpServer, path: "/ws", maxPayload: 64 * 1024 });
 
 wss.on("connection", (ws, req) => {
   const connId = randomUUID();
@@ -84,7 +98,7 @@ wss.on("connection", (ws, req) => {
 
   applyActions(addConnection(state, connId, clientIp(req)).actions);
   // Hand the ICE configuration to the client immediately on connect.
-  ws.send(JSON.stringify({ type: "welcome", connId, iceServers: config.iceServers }));
+  safeSend(ws, JSON.stringify({ type: "welcome", connId, iceServers: config.iceServers }));
 
   ws.on("pong", () => {
     ws.isAlive = true;
@@ -130,6 +144,9 @@ const heartbeat = setInterval(() => {
       /* ignore */
     }
   }
+  // Reclaim stale offline device registrations so the map can't grow unbounded.
+  const removed = sweep(state);
+  if (removed) logLine("devices_swept", { removed });
 }, config.heartbeatIntervalMs);
 
 wss.on("close", () => clearInterval(heartbeat));
