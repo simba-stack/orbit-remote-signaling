@@ -1,23 +1,35 @@
 // Orbit Remote — signaling core.
 //
-// Pure, transport-agnostic state machine for WebRTC signalling. It knows nothing
-// about WebSockets: it takes a connection id + an incoming message and returns a
-// list of *actions* (messages to send, logs to write). This keeps the protocol
-// fully unit-testable without a network stack.
-//
-// Roles:
-//   - "agent"      : an Android device that registers itself and waits for control
-//   - "controller" : a desktop client that connects to an agent by device id + code
-//
-// Connection codes provide first-line authorisation: the agent owns a code and a
-// controller must present the matching code to establish a session. Trusted-device
-// whitelisting and first-connection confirmation are enforced on the agent side;
-// the server enforces existence, online status and code match.
+// Pure, transport-agnostic state machine for WebRTC signalling plus an anonymous
+// "bridge chat" relay (PC <-> phone text, used to work around Android clipboard
+// limits). It knows nothing about WebSockets: it takes a connection id + an
+// incoming message and returns a list of *actions* (messages to send, logs to
+// write). This keeps the protocol fully unit-testable without a network stack.
 
-import { randomInt } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 
 const DEVICE_ID_LENGTH = 9; // AnyDesk-style numeric id
 const CODE_LENGTH = 6;
+
+// --- Bridge chat limits (anonymous PC<->phone text relay) ---------------
+const CHAT_MAX_MESSAGES = 100;       // kept per room (oldest dropped)
+const CHAT_MAX_ROOMS = 1000;         // global cap
+const CHAT_MAX_ROOMS_PER_CONN = 8;
+const CHAT_TEXT_MAX = 4000;
+const CHAT_FROM_MAX = 24;
+const CHAT_RATE_MAX = 20;            // messages per window, per connection
+const CHAT_RATE_WINDOW = 10_000;     // ms
+const CHAT_ROOM_RE = /^[A-Za-z0-9]{4,32}$/;
+
+// Strip control characters but keep tab (9), newline (10) and carriage return (13).
+function stripControl(s) {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 9 || c === 10 || c === 13 || (c >= 32 && c !== 127)) out += s[i];
+  }
+  return out;
+}
 
 // CSPRNG-backed [0,1) source so device ids and connection codes are not
 // predictable (Math.random is not cryptographically secure). Tests can still
@@ -45,18 +57,21 @@ function defaultGenCode(rnd = secureRandom) {
 /**
  * Create a fresh signaling state.
  * @param {object} [opts]
- * @param {() => string} [opts.genId]   device id generator (injectable for tests)
- * @param {() => string} [opts.genCode] code generator (injectable for tests)
- * @param {() => number} [opts.now]     clock (ms), injectable for tests
+ * @param {() => string} [opts.genId]    device id generator (injectable for tests)
+ * @param {() => string} [opts.genCode]  code generator (injectable for tests)
+ * @param {() => string} [opts.genMsgId] chat message id generator (injectable)
+ * @param {() => number} [opts.now]      clock (ms), injectable for tests
  */
 export function createState(opts = {}) {
   return {
     genId: opts.genId || (() => defaultGenId()),
     genCode: opts.genCode || (() => defaultGenCode()),
+    genMsgId: opts.genMsgId || (() => randomUUID()),
     now: opts.now || (() => Date.now()),
-    connections: new Map(), // connId -> { connId, ip, role, deviceId, sessionIds:Set }
-    devices: new Map(), // deviceId -> { deviceId, name, platform, code, connId, registeredAt, lastSeen }
-    sessions: new Map(), // sessionId -> { sessionId, controllerConnId, agentConnId, agentDeviceId, startedAt }
+    connections: new Map(), // connId -> { connId, ip, role, deviceId, sessionIds:Set, rooms:Set }
+    devices: new Map(),     // deviceId -> { deviceId, name, platform, code, connId, registeredAt, lastSeen }
+    sessions: new Map(),    // sessionId -> { sessionId, controllerConnId, agentConnId, agentDeviceId, startedAt }
+    chatRooms: new Map(),   // room -> { members:Set<connId>, messages:[{id,seq,text,from,ts}], seq }
     sessionSeq: 0,
   };
 }
@@ -68,6 +83,7 @@ export function addConnection(state, connId, ip) {
     role: null,
     deviceId: null,
     sessionIds: new Set(),
+    rooms: new Set(),
   });
   return { actions: [] };
 }
@@ -158,6 +174,8 @@ export function handleMessage(state, connId, msg) {
         connId,
         registeredAt: existing ? existing.registeredAt : state.now(),
         lastSeen: state.now(),
+        authFails: existing ? existing.authFails || 0 : 0,
+        lockedUntil: existing ? existing.lockedUntil || 0 : 0,
       });
 
       return {
@@ -255,12 +273,85 @@ export function handleMessage(state, connId, msg) {
       return { actions: endSession(state, msg.sessionId, "hangup", connId) };
     }
 
+    // ---- Bridge chat -----------------------------------------------------
+
+    case "chat-join": {
+      const room = msg.room;
+      if (typeof room !== "string" || !CHAT_ROOM_RE.test(room)) {
+        return { actions: [send(connId, { type: "error", code: "bad_room" })] };
+      }
+      let chat = state.chatRooms.get(room);
+      if (!chat) {
+        if (state.chatRooms.size >= CHAT_MAX_ROOMS) {
+          return { actions: [send(connId, { type: "error", code: "too_many_rooms" })] };
+        }
+        chat = { members: new Set(), messages: [], seq: 0 };
+        state.chatRooms.set(room, chat);
+      }
+      if (!conn.rooms.has(room) && conn.rooms.size >= CHAT_MAX_ROOMS_PER_CONN) {
+        return { actions: [send(connId, { type: "error", code: "too_many_rooms" })] };
+      }
+      chat.members.add(connId);
+      conn.rooms.add(room);
+      return { actions: [send(connId, { type: "chat-history", room, messages: chat.messages })] };
+    }
+
+    case "chat-send": {
+      const room = msg.room;
+      if (typeof room !== "string" || !conn.rooms.has(room)) {
+        return { actions: [send(connId, { type: "error", code: "not_in_room" })] };
+      }
+      const chat = state.chatRooms.get(room);
+      if (!chat) {
+        return { actions: [send(connId, { type: "error", code: "not_in_room" })] };
+      }
+      // Per-connection rate limit.
+      const nowTs = state.now();
+      if (!conn.chatWindowStart || nowTs - conn.chatWindowStart >= CHAT_RATE_WINDOW) {
+        conn.chatWindowStart = nowTs;
+        conn.chatCount = 0;
+      }
+      conn.chatCount = (conn.chatCount || 0) + 1;
+      if (conn.chatCount > CHAT_RATE_MAX) {
+        return { actions: [send(connId, { type: "error", code: "rate_limited" })] };
+      }
+      let text = typeof msg.text === "string" ? stripControl(msg.text) : "";
+      text = text.replace(/[ \t\r\n]+$/g, ""); // trim trailing whitespace
+      if (text.length === 0 || text.length > CHAT_TEXT_MAX) {
+        return { actions: [send(connId, { type: "error", code: "bad_text" })] };
+      }
+      const from = typeof msg.from === "string"
+        ? stripControl(msg.from).trim().slice(0, CHAT_FROM_MAX)
+        : "";
+      const message = { id: state.genMsgId(), seq: ++chat.seq, text, from, ts: nowTs };
+      chat.messages.push(message);
+      if (chat.messages.length > CHAT_MAX_MESSAGES) chat.messages.shift();
+      const actions = [];
+      for (const cid of chat.members) {
+        actions.push(send(cid, { type: "chat-msg", room, message }));
+      }
+      return { actions };
+    }
+
+    case "chat-leave": {
+      const room = msg.room;
+      if (typeof room === "string" && conn.rooms.has(room)) {
+        conn.rooms.delete(room);
+        const chat = state.chatRooms.get(room);
+        if (chat) {
+          chat.members.delete(connId);
+          if (chat.members.size === 0) state.chatRooms.delete(room);
+        }
+      }
+      return { actions: [] };
+    }
+
     default:
       return { actions: [send(connId, { type: "error", code: "unknown_type", received: msg.type })] };
   }
 }
 
-/** Clean up a dropped connection: end its sessions and free its device. */
+/** Clean up a dropped connection: end its sessions, free its device, leave rooms. */
 export function removeConnection(state, connId) {
   const conn = state.connections.get(connId);
   if (!conn) return { actions: [] };
@@ -268,6 +359,14 @@ export function removeConnection(state, connId) {
 
   for (const sessionId of Array.from(conn.sessionIds)) {
     actions.push(...endSession(state, sessionId, "peer_disconnect", connId));
+  }
+
+  for (const room of conn.rooms) {
+    const chat = state.chatRooms.get(room);
+    if (chat) {
+      chat.members.delete(connId);
+      if (chat.members.size === 0) state.chatRooms.delete(room);
+    }
   }
 
   if (conn.deviceId) {
@@ -285,8 +384,8 @@ export function removeConnection(state, connId) {
 }
 
 /**
- * Evict offline device registrations older than ttl so the devices map can't grow
- * without bound (memory/DoS protection). Returns the number removed.
+ * Evict offline device registrations older than ttl and empty chat rooms so the
+ * maps can't grow without bound (memory/DoS protection). Returns count removed.
  */
 export function sweep(state, ttlMs = 86_400_000) {
   const cutoff = state.now() - ttlMs;
@@ -294,6 +393,12 @@ export function sweep(state, ttlMs = 86_400_000) {
   for (const [id, d] of state.devices) {
     if (!d.connId && (d.lastSeen || 0) < cutoff) {
       state.devices.delete(id);
+      removed++;
+    }
+  }
+  for (const [room, chat] of state.chatRooms) {
+    if (chat.members.size === 0) {
+      state.chatRooms.delete(room);
       removed++;
     }
   }
@@ -309,6 +414,7 @@ export function stats(state) {
     devices: state.devices.size,
     devicesOnline: online,
     sessions: state.sessions.size,
+    chatRooms: state.chatRooms.size,
   };
 }
 
