@@ -156,7 +156,15 @@ export function handleMessage(state, connId, msg) {
       }
 
       const existing = state.devices.get(deviceId);
-      const code = existing && existing.code ? existing.code : state.genCode();
+      // Honor the agent's proposed (device-derived) code for a new registration so
+      // the code stays stable across server restarts; reuse the stored one if the
+      // device already exists; otherwise mint a fresh random code.
+      const proposedCode = typeof msg.code === "string" && /^[0-9]{6}$/.test(msg.code)
+        ? msg.code
+        : null;
+      const code = existing && existing.code
+        ? existing.code
+        : (proposedCode || state.genCode());
 
       // If another live connection held this device, detach it.
       if (existing && existing.connId && existing.connId !== connId) {
